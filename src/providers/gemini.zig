@@ -935,7 +935,7 @@ pub const GeminiProvider = struct {
         const url = try buildUrl(allocator, model, auth);
         defer allocator.free(url);
 
-        const body = try buildChatRequestBody(allocator, request, temperature);
+        const body = try buildChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
         const resp_body = if (auth.isApiKey())
@@ -995,7 +995,7 @@ pub const GeminiProvider = struct {
         const url = try buildStreamUrl(allocator, model, auth);
         defer allocator.free(url);
 
-        const body = try buildChatRequestBody(allocator, request, temperature);
+        const body = try buildChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
         if (auth.isApiKey()) {
@@ -1014,6 +1014,7 @@ pub const GeminiProvider = struct {
 fn buildChatRequestBody(
     allocator: std.mem.Allocator,
     request: ChatRequest,
+    model: []const u8,
     temperature: f64,
 ) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -1096,6 +1097,8 @@ fn buildChatRequestBody(
     var max_buf: [16]u8 = undefined;
     const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{max_output_tokens}) catch return error.GeminiApiError;
     try buf.appendSlice(allocator, max_str);
+
+    try root.appendGeminiThinkingConfig(&buf, allocator, model, request.reasoning_effort);
     try buf.appendSlice(allocator, "}}");
 
     return try buf.toOwnedSlice(allocator);
@@ -1504,7 +1507,7 @@ test "gemini buildChatRequestBody plain text" {
     var msgs = [_]root.ChatMessage{
         root.ChatMessage.user("Hello"),
     };
-    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs }, 0.7);
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs }, "gemini-2.5-flash", 0.7);
     defer alloc.free(body);
     // Verify valid JSON
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
@@ -1524,7 +1527,7 @@ test "gemini buildChatRequestBody honors request max_tokens override" {
     const body = try buildChatRequestBody(alloc, .{
         .messages = &msgs,
         .max_tokens = 2048,
-    }, 0.7);
+    }, "gemini-2.5-flash", 0.7);
     defer alloc.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
@@ -1533,6 +1536,42 @@ test "gemini buildChatRequestBody honors request max_tokens override" {
     const max_output = generation_config.get("maxOutputTokens").?;
     try std.testing.expect(max_output == .integer);
     try std.testing.expectEqual(@as(i64, 2048), max_output.integer);
+}
+
+test "gemini buildChatRequestBody maps reasoning_effort to thinkingLevel on gemini-3 flash" {
+    const alloc = std.testing.allocator;
+    var msgs = [_]root.ChatMessage{
+        root.ChatMessage.user("Hello"),
+    };
+    const body = try buildChatRequestBody(alloc, .{
+        .messages = &msgs,
+        .reasoning_effort = "medium",
+    }, "gemini-3.1-flash", 0.7);
+    defer alloc.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const generation_config = parsed.value.object.get("generationConfig").?.object;
+    const thinking = generation_config.get("thinkingConfig").?.object;
+    try std.testing.expectEqualStrings("medium", thinking.get("thinkingLevel").?.string);
+}
+
+test "gemini buildChatRequestBody maps reasoning_effort to thinkingBudget on gemini-2.5" {
+    const alloc = std.testing.allocator;
+    var msgs = [_]root.ChatMessage{
+        root.ChatMessage.user("Hello"),
+    };
+    const body = try buildChatRequestBody(alloc, .{
+        .messages = &msgs,
+        .reasoning_effort = "high",
+    }, "gemini-2.5-pro", 0.7);
+    defer alloc.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const generation_config = parsed.value.object.get("generationConfig").?.object;
+    const thinking = generation_config.get("thinkingConfig").?.object;
+    try std.testing.expectEqual(@as(i64, 24576), thinking.get("thinkingBudget").?.integer);
 }
 
 test "gemini buildChatRequestBody with content_parts inlineData" {
@@ -1544,7 +1583,7 @@ test "gemini buildChatRequestBody with content_parts inlineData" {
     var msgs = [_]root.ChatMessage{
         .{ .role = .user, .content = "What is this?", .content_parts = cp },
     };
-    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs }, 0.7);
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs }, "gemini-2.5-flash", 0.7);
     defer alloc.free(body);
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -1567,7 +1606,7 @@ test "gemini buildChatRequestBody with image_url special chars" {
     var msgs = [_]root.ChatMessage{
         .{ .role = .user, .content = "", .content_parts = cp },
     };
-    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs }, 0.7);
+    const body = try buildChatRequestBody(alloc, .{ .messages = &msgs }, "gemini-2.5-flash", 0.7);
     defer alloc.free(body);
     // Must produce valid JSON despite special chars in URL
     const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});

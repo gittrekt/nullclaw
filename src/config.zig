@@ -3830,6 +3830,28 @@ test "json parse reasoning_effort low" {
     allocator.free(cfg.reasoning_effort.?);
 }
 
+test "json parse reasoning_effort minimal" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"reasoning_effort": "minimal"}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("minimal", cfg.reasoning_effort.?);
+    allocator.free(cfg.reasoning_effort.?);
+}
+
+test "json parse reasoning_effort xhigh" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"reasoning_effort": "xhigh"}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("xhigh", cfg.reasoning_effort.?);
+    allocator.free(cfg.reasoning_effort.?);
+}
+
 test "unknown foreign fields silently ignored" {
     const allocator = std.testing.allocator;
     const json =

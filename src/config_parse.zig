@@ -352,9 +352,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     }
     if (root.get("reasoning_effort")) |v| {
         if (v == .string) {
-            if (std.mem.eql(u8, v.string, "low") or
+            if (std.mem.eql(u8, v.string, "minimal") or
+                std.mem.eql(u8, v.string, "low") or
                 std.mem.eql(u8, v.string, "medium") or
                 std.mem.eql(u8, v.string, "high") or
+                std.mem.eql(u8, v.string, "xhigh") or
                 std.mem.eql(u8, v.string, "none"))
             {
                 self.reasoning_effort = try self.allocator.dupe(u8, v.string);

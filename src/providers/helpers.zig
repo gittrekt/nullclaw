@@ -191,6 +191,109 @@ pub fn appendGenerationFields(
     }
 }
 
+const GeminiReasoningEffort = enum {
+    none,
+    minimal,
+    low,
+    medium,
+    high,
+    xhigh,
+};
+
+const GeminiThinkingProfile = union(enum) {
+    level: []const u8,
+    budget: u32,
+};
+
+fn parseGeminiReasoningEffort(reasoning_effort: ?[]const u8) ?GeminiReasoningEffort {
+    const raw = reasoning_effort orelse return null;
+    if (std.ascii.eqlIgnoreCase(raw, "off") or std.ascii.eqlIgnoreCase(raw, "none")) return .none;
+    if (std.ascii.eqlIgnoreCase(raw, "minimal")) return .minimal;
+    if (std.ascii.eqlIgnoreCase(raw, "low")) return .low;
+    if (std.ascii.eqlIgnoreCase(raw, "medium")) return .medium;
+    if (std.ascii.eqlIgnoreCase(raw, "high")) return .high;
+    if (std.ascii.eqlIgnoreCase(raw, "xhigh")) return .xhigh;
+    return null;
+}
+
+fn geminiThinkingProfile(model: []const u8, reasoning_effort: ?[]const u8) ?GeminiThinkingProfile {
+    const effort = parseGeminiReasoningEffort(reasoning_effort) orelse return null;
+
+    var lower_buf: [160]u8 = undefined;
+    const lower_len = @min(model.len, lower_buf.len);
+    for (model[0..lower_len], 0..) |c, idx| {
+        lower_buf[idx] = std.ascii.toLower(c);
+    }
+    const lower = lower_buf[0..lower_len];
+
+    const is_gemini_3 = std.mem.indexOf(u8, lower, "gemini-3") != null;
+    const is_gemini_25 = std.mem.indexOf(u8, lower, "gemini-2.5") != null;
+    const is_flash = std.mem.indexOf(u8, lower, "flash") != null;
+    const is_pro = std.mem.indexOf(u8, lower, "pro") != null;
+
+    // Gemini 3 family: use thinking levels.
+    // Gemini 3 Pro supports only low/high, while Flash supports minimal/low/medium/high.
+    if (is_gemini_3) {
+        if (is_flash) {
+            return .{
+                .level = switch (effort) {
+                    .none => "minimal",
+                    .minimal => "minimal",
+                    .low => "low",
+                    .medium => "medium",
+                    .high, .xhigh => "high",
+                },
+            };
+        }
+        return .{
+            .level = switch (effort) {
+                .high, .xhigh => "high",
+                .none, .minimal, .low, .medium => "low",
+            },
+        };
+    }
+
+    // Gemini 2.5 family: use thinking budget.
+    if (is_gemini_25) {
+        return switch (effort) {
+            .none => if (is_pro) null else .{ .budget = 0 },
+            .minimal, .low => .{ .budget = 1024 },
+            .medium => .{ .budget = 8192 },
+            .high, .xhigh => .{ .budget = 24576 },
+        };
+    }
+
+    return null;
+}
+
+/// Append Gemini/Vertex thinking controls under generationConfig when reasoning effort is set.
+/// Mapping:
+/// - Gemini 3 models => `thinkingConfig.thinkingLevel`
+/// - Gemini 2.5 models => `thinkingConfig.thinkingBudget`
+pub fn appendGeminiThinkingConfig(
+    buf: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    model: []const u8,
+    reasoning_effort: ?[]const u8,
+) !void {
+    const profile = geminiThinkingProfile(model, reasoning_effort) orelse return;
+
+    try buf.appendSlice(allocator, ",\"thinkingConfig\":{");
+    switch (profile) {
+        .level => |level| {
+            try buf.appendSlice(allocator, "\"thinkingLevel\":");
+            try json_util.appendJsonString(buf, allocator, level);
+        },
+        .budget => |budget| {
+            try buf.appendSlice(allocator, "\"thinkingBudget\":");
+            var budget_buf: [16]u8 = undefined;
+            const budget_str = std.fmt.bufPrint(&budget_buf, "{d}", .{budget}) catch return error.FormatError;
+            try buf.appendSlice(allocator, budget_str);
+        },
+    }
+    try buf.append(allocator, '}');
+}
+
 /// Serialize a single message's content field (plain string or multimodal content parts array).
 /// OpenAI format: text → {"type":"text","text":"..."}, image_url → {"type":"image_url","image_url":{"url":"...","detail":"..."}},
 /// image_base64 → {"type":"image_url","image_url":{"url":"data:mime;base64,..."}}.
@@ -573,4 +676,67 @@ test "serializeMessageContent with image_url part" {
     const img_obj = arr.items[0].object.get("image_url").?.object;
     try std.testing.expectEqualStrings("https://example.com/cat.jpg", img_obj.get("url").?.string);
     try std.testing.expectEqualStrings("auto", img_obj.get("detail").?.string);
+}
+
+test "appendGeminiThinkingConfig uses thinkingLevel for gemini-3 flash" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try buf.appendSlice(alloc, "{\"generationConfig\":{\"maxOutputTokens\":1024");
+    try appendGeminiThinkingConfig(&buf, alloc, "gemini-3.1-flash", "medium");
+    try buf.appendSlice(alloc, "}}");
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items, .{});
+    defer parsed.deinit();
+    const cfg = parsed.value.object.get("generationConfig").?.object;
+    const thinking = cfg.get("thinkingConfig").?.object;
+    try std.testing.expectEqualStrings("medium", thinking.get("thinkingLevel").?.string);
+}
+
+test "appendGeminiThinkingConfig maps unsupported gemini-3 pro medium to low level" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try buf.appendSlice(alloc, "{\"generationConfig\":{\"maxOutputTokens\":1024");
+    try appendGeminiThinkingConfig(&buf, alloc, "gemini-3.1-pro-preview", "medium");
+    try buf.appendSlice(alloc, "}}");
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items, .{});
+    defer parsed.deinit();
+    const cfg = parsed.value.object.get("generationConfig").?.object;
+    const thinking = cfg.get("thinkingConfig").?.object;
+    try std.testing.expectEqualStrings("low", thinking.get("thinkingLevel").?.string);
+}
+
+test "appendGeminiThinkingConfig uses thinkingBudget for gemini-2.5 flash" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try buf.appendSlice(alloc, "{\"generationConfig\":{\"maxOutputTokens\":1024");
+    try appendGeminiThinkingConfig(&buf, alloc, "gemini-2.5-flash", "high");
+    try buf.appendSlice(alloc, "}}");
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items, .{});
+    defer parsed.deinit();
+    const cfg = parsed.value.object.get("generationConfig").?.object;
+    const thinking = cfg.get("thinkingConfig").?.object;
+    try std.testing.expectEqual(@as(i64, 24576), thinking.get("thinkingBudget").?.integer);
+}
+
+test "appendGeminiThinkingConfig omits none budget for gemini-2.5 pro" {
+    const alloc = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(alloc);
+
+    try buf.appendSlice(alloc, "{\"generationConfig\":{\"maxOutputTokens\":1024");
+    try appendGeminiThinkingConfig(&buf, alloc, "gemini-2.5-pro", "none");
+    try buf.appendSlice(alloc, "}}");
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, buf.items, .{});
+    defer parsed.deinit();
+    const cfg = parsed.value.object.get("generationConfig").?.object;
+    try std.testing.expect(cfg.get("thinkingConfig") == null);
 }

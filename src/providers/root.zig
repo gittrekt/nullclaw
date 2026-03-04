@@ -50,6 +50,7 @@ pub const buildRequestBody = helpers.buildRequestBody;
 pub const buildRequestBodyWithSystem = helpers.buildRequestBodyWithSystem;
 pub const isReasoningModel = helpers.isReasoningModel;
 pub const appendGenerationFields = helpers.appendGenerationFields;
+pub const appendGeminiThinkingConfig = helpers.appendGeminiThinkingConfig;
 pub const convertToolsOpenAI = helpers.convertToolsOpenAI;
 pub const serializeMessageContent = helpers.serializeMessageContent;
 pub const serializeContentPart = helpers.serializeContentPart;
