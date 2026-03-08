@@ -24,12 +24,21 @@ const security = @import("../security/policy.zig");
 const auth_mod = @import("../auth.zig");
 const onboard = @import("../onboard.zig");
 const streaming = @import("../streaming.zig");
+const commands = @import("commands.zig");
 
 const Agent = @import("root.zig").Agent;
 
 const CliStreamCtx = struct {
     sink: streaming.Sink,
 };
+
+fn shouldHandleSlashCommandLocally(message: []const u8) bool {
+    const trimmed = std.mem.trim(u8, message, " \t\r\n");
+    if (trimmed.len <= 1 or trimmed[0] != '/') return false;
+    // Bare /new and /reset are intentionally routed through Agent.turn()
+    // to trigger fresh-session startup behavior.
+    return commands.bareSessionResetPrompt(trimmed) == null;
+}
 
 fn cliStreamSinkCallback(_: *anyopaque, event: streaming.Event) void {
     if (event.stage != .chunk or event.text.len == 0) return;
@@ -311,6 +320,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             agent.stream_ctx = @ptrCast(&stream_ctx);
         }
 
+        if (shouldHandleSlashCommandLocally(message)) {
+            if (try agent.handleSlashCommand(message)) |slash_response| {
+                defer allocator.free(slash_response);
+                try w.print("{s}\n", .{slash_response});
+                try w.flush();
+                return;
+            }
+        }
+
         const response = agent.turn(message) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
@@ -429,6 +447,15 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         // Append to history
         repl_history.append(allocator, allocator.dupe(u8, line) catch continue) catch {};
 
+        if (shouldHandleSlashCommandLocally(line)) {
+            if (try agent.handleSlashCommand(line)) |slash_response| {
+                defer allocator.free(slash_response);
+                try w.print("\n{s}\n\n", .{slash_response});
+                try w.flush();
+                continue;
+            }
+        }
+
         const response = agent.turn(line) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
@@ -497,6 +524,15 @@ test "parseAgentArgs parses provider and model overrides" {
     try std.testing.expectEqualStrings("ollama", parsed.provider_override.?);
     try std.testing.expectEqualStrings("llama3.2:latest", parsed.model_override.?);
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), parsed.temperature_override.?, 0.000001);
+}
+
+test "shouldHandleSlashCommandLocally recognizes local slash commands" {
+    try std.testing.expect(shouldHandleSlashCommandLocally("/help"));
+    try std.testing.expect(shouldHandleSlashCommandLocally(" /status "));
+    try std.testing.expect(!shouldHandleSlashCommandLocally("hello"));
+    try std.testing.expect(!shouldHandleSlashCommandLocally("/new"));
+    try std.testing.expect(!shouldHandleSlashCommandLocally("/reset"));
+    try std.testing.expect(shouldHandleSlashCommandLocally("/new gpt-4o"));
 }
 
 test "parseAgentArgs keeps the last override value" {
