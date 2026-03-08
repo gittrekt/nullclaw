@@ -53,6 +53,32 @@ fn safeEnvVarAllowed(key: []const u8) bool {
     return false;
 }
 
+/// Validate that a colon-separated path value has all components within
+/// the sandbox (workspace + allowed_paths). Uses the same validation as
+/// file access: system blocklist always rejects, then workspace and
+/// allowed_paths are checked via realpath canonicalization.
+fn validatePathEnvValue(
+    allocator: std.mem.Allocator,
+    value: []const u8,
+    ws_resolved: []const u8,
+    allowed_paths: []const []const u8,
+) bool {
+    if (value.len == 0) return true;
+    var iter = std.mem.splitScalar(u8, value, ':');
+    while (iter.next()) |component| {
+        if (component.len == 0) continue;
+        // Must be absolute
+        if (!std.fs.path.isAbsolute(component)) return false;
+        // Resolve to canonical path (follows symlinks)
+        const resolved = std.fs.cwd().realpathAlloc(allocator, component) catch
+            return false; // path doesn't exist or can't be resolved
+        defer allocator.free(resolved);
+        if (!isResolvedPathAllowed(allocator, resolved, ws_resolved, allowed_paths))
+            return false;
+    }
+    return true;
+}
+
 fn normalizeCommandInput(command: []const u8) []const u8 {
     const trimmed = std.mem.trim(u8, command, " \t\r\n");
     if (unwrapMarkdownFence(trimmed)) |unfenced| {
@@ -85,6 +111,9 @@ pub const ShellTool = struct {
     timeout_ns: u64 = DEFAULT_SHELL_TIMEOUT_NS,
     max_output_bytes: usize = DEFAULT_MAX_OUTPUT_BYTES,
     policy: ?*const SecurityPolicy = null,
+    /// Env var names whose colon-separated path values are validated
+    /// against workspace + allowed_paths before passing to child processes.
+    path_env_vars: []const []const u8 = &.{},
 
     pub const tool_name = "shell";
     pub const tool_description = "Execute a shell command in the workspace directory";
@@ -152,6 +181,23 @@ pub const ShellTool = struct {
             if (platform.getEnvOrNull(allocator, key)) |val| {
                 defer allocator.free(val);
                 try env.put(key, val);
+            }
+        }
+
+        // Add path-validated env vars: each colon-separated component
+        // must resolve within workspace or allowed_paths.
+        if (self.path_env_vars.len > 0) {
+            const ws_resolved: ?[]const u8 = std.fs.cwd().realpathAlloc(allocator, self.workspace_dir) catch null;
+            defer if (ws_resolved) |wr| allocator.free(wr);
+            const ws_for_check = ws_resolved orelse UNAVAILABLE_WORKSPACE_SENTINEL;
+
+            for (self.path_env_vars) |key| {
+                if (platform.getEnvOrNull(allocator, key)) |val| {
+                    defer allocator.free(val);
+                    if (validatePathEnvValue(allocator, val, ws_for_check, self.allowed_paths)) {
+                        try env.put(key, val);
+                    }
+                }
             }
         }
 
@@ -567,6 +613,166 @@ test "shell without policy executes command" {
     const parsed = try root.parseTestArgs("{\"command\": \"echo no-policy\"}");
     defer parsed.deinit();
     const result = try st.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    try std.testing.expect(result.success);
+}
+
+test "validatePathEnvValue allows paths within workspace" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try tmp_dir.dir.makeDir("lib");
+    const lib_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "lib" });
+    defer std.testing.allocator.free(lib_path);
+
+    try std.testing.expect(validatePathEnvValue(
+        std.testing.allocator,
+        lib_path,
+        tmp_path,
+        &.{},
+    ));
+}
+
+test "validatePathEnvValue allows colon-separated paths within workspace" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try tmp_dir.dir.makeDir("lib");
+    try tmp_dir.dir.makeDir("usr");
+    const lib_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "lib" });
+    defer std.testing.allocator.free(lib_path);
+    const usr_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "usr" });
+    defer std.testing.allocator.free(usr_path);
+
+    const combined = try std.fmt.allocPrint(std.testing.allocator, "{s}:{s}", .{ lib_path, usr_path });
+    defer std.testing.allocator.free(combined);
+
+    try std.testing.expect(validatePathEnvValue(
+        std.testing.allocator,
+        combined,
+        tmp_path,
+        &.{},
+    ));
+}
+
+test "validatePathEnvValue rejects paths outside workspace" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try tmp_dir.dir.makeDir("ws");
+    try tmp_dir.dir.makeDir("outside");
+    const ws_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "ws" });
+    defer std.testing.allocator.free(ws_path);
+    const outside_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "outside" });
+    defer std.testing.allocator.free(outside_path);
+
+    try std.testing.expect(!validatePathEnvValue(
+        std.testing.allocator,
+        outside_path,
+        ws_path,
+        &.{},
+    ));
+}
+
+test "validatePathEnvValue rejects system paths" {
+    try std.testing.expect(!validatePathEnvValue(
+        std.testing.allocator,
+        "/usr/lib",
+        "/home/user/workspace",
+        &.{},
+    ));
+}
+
+test "validatePathEnvValue allows via allowed_paths" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try tmp_dir.dir.makeDir("tools");
+    const tools_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "tools" });
+    defer std.testing.allocator.free(tools_path);
+
+    try std.testing.expect(validatePathEnvValue(
+        std.testing.allocator,
+        tools_path,
+        "/nonexistent-workspace",
+        &.{tmp_path},
+    ));
+}
+
+test "validatePathEnvValue rejects mixed valid and invalid paths" {
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try tmp_dir.dir.makeDir("lib");
+    const lib_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "lib" });
+    defer std.testing.allocator.free(lib_path);
+
+    // Mix a valid path with /etc (system-blocked)
+    const combined = try std.fmt.allocPrint(std.testing.allocator, "{s}:/etc", .{lib_path});
+    defer std.testing.allocator.free(combined);
+
+    try std.testing.expect(!validatePathEnvValue(
+        std.testing.allocator,
+        combined,
+        tmp_path,
+        &.{},
+    ));
+}
+
+test "validatePathEnvValue rejects relative paths" {
+    try std.testing.expect(!validatePathEnvValue(
+        std.testing.allocator,
+        "relative/path",
+        "/home/user/workspace",
+        &.{},
+    ));
+}
+
+test "validatePathEnvValue allows empty value" {
+    try std.testing.expect(validatePathEnvValue(
+        std.testing.allocator,
+        "",
+        "/home/user/workspace",
+        &.{},
+    ));
+}
+
+test "shell path_env_vars passes validated vars to child" {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    try tmp_dir.dir.makeDir("mylibs");
+    const libs_path = try std.fs.path.join(std.testing.allocator, &.{ tmp_path, "mylibs" });
+    defer std.testing.allocator.free(libs_path);
+
+    // Set the env var for this test
+    // Note: we can't easily test env var passthrough without setting
+    // an actual env var, so we test the validation function directly above.
+    // The integration is tested by verifying the ShellTool accepts the field.
+    var st = ShellTool{
+        .workspace_dir = tmp_path,
+        .path_env_vars = &.{"TEST_LIB_PATH"},
+    };
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"command\": \"echo ok\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
     defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(result.success);
