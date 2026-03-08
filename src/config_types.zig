@@ -1078,6 +1078,7 @@ pub const HttpRequestConfig = struct {
     /// BRAVE_API_KEY is not available.
     /// Examples:
     ///   - "https://searx.example.com"
+    ///   - "http://searx.example.com"
     ///   - "https://searx.example.com/search"
     search_base_url: ?[]const u8 = null,
     /// Search provider for web_search.
@@ -1089,16 +1090,21 @@ pub const HttpRequestConfig = struct {
 
     /// Validate optional SearXNG base URL accepted by web_search.
     /// Allowed forms:
-    ///   - https://host
-    ///   - https://host/
-    ///   - https://host/search
-    ///   - https://host/search/
+    ///   - http://host  or https://host
+    ///   - http://host/ or https://host/
+    ///   - http://host/search  or https://host/search
+    ///   - http://host/search/ or https://host/search/
     pub fn isValidSearchBaseUrl(raw: []const u8) bool {
         const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        if (!std.mem.startsWith(u8, trimmed, "https://")) return false;
+        const scheme_len = if (std.mem.startsWith(u8, trimmed, "https://"))
+            "https://".len
+        else if (std.mem.startsWith(u8, trimmed, "http://"))
+            "http://".len
+        else
+            return false;
         if (std.mem.indexOfAny(u8, trimmed, "?#") != null) return false;
 
-        const no_scheme = trimmed["https://".len..];
+        const no_scheme = trimmed[scheme_len..];
         if (no_scheme.len == 0 or no_scheme[0] == '/') return false;
 
         const slash_pos = std.mem.indexOfScalar(u8, no_scheme, '/');
@@ -1464,8 +1470,14 @@ test "HttpRequestConfig search base URL validation" {
     try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/search"));
     try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/search/"));
 
-    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("http://searx.example.com"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://searx.example.com"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://searx.example.com/"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://searx.example.com/search"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://searx.example.com/search/"));
+
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("ftp://searx.example.com"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("http://"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com?x=1"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com#frag"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/custom"));
