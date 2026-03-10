@@ -1479,6 +1479,56 @@ test "persisted session falls back to rendered response when degraded turn has n
     try testing.expectEqual(@as(u64, expected_tokens), restored_session.agent.total_tokens);
 }
 
+test "restored session token reconstruction stays aligned across response cache hits" {
+    var mock = MockProvider{ .response = "assistant reply" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var response_cache = try memory_mod.ResponseCache.init(":memory:", 60, 1000);
+    defer response_cache.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        &response_cache,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:chat-cache";
+    const first = try sm.processMessage(session_key, "hello", .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(first);
+
+    const second = try sm.processMessage(session_key, "hello", .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(second);
+    try testing.expectEqualStrings(first, second);
+
+    const expected_tokens = agent_mod.estimate_text_tokens("assistant reply");
+    const live_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(u64, expected_tokens) * 2, live_session.agent.total_tokens);
+
+    live_session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(u64, expected_tokens) * 2, restored_session.agent.total_tokens);
+}
+
 test "processMessage different keys — independent sessions" {
     var mock = MockProvider{ .response = "ok" };
     const cfg = testConfig();

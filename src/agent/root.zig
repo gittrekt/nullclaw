@@ -1096,6 +1096,15 @@ pub const Agent = struct {
                     .role = .assistant,
                     .content = history_copy,
                 });
+                // Keep session totals monotonic across cache hits and reloads.
+                // Reload reconstructs from persisted assistant replies, so cached
+                // replies must contribute the same lightweight estimate live.
+                const cached_tokens = estimate_text_tokens(cached_response);
+                self.last_turn_usage = .{
+                    .completion_tokens = cached_tokens,
+                    .total_tokens = cached_tokens,
+                };
+                self.total_tokens += cached_tokens;
                 return cached_response;
             }
         }
