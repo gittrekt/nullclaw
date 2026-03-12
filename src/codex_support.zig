@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("platform.zig");
+const auth = @import("auth.zig");
 
 pub const ProbeResult = struct {
     live_ok: bool,
@@ -23,6 +24,7 @@ pub const codex_model_fallbacks = [_][]const u8{
 };
 
 pub const DEFAULT_CODEX_MODEL = codex_model_fallbacks[0];
+pub const OPENAI_CODEX_CREDENTIAL_KEY = "openai-codex";
 
 const CommandRunResult = struct {
     stdout: []u8,
@@ -83,8 +85,21 @@ pub fn probeOpenAiCodex(allocator: std.mem.Allocator) ProbeResult {
 }
 
 pub fn hasOpenAiCodexCredential(allocator: std.mem.Allocator) bool {
-    if (hasNullclawOpenAiCodexTokens(allocator)) return true;
-    return hasCodexCliTokens(allocator);
+    if (loadStoredOpenAiCodexCredential(allocator)) |token| {
+        token.deinit(allocator);
+        return true;
+    }
+
+    if (loadCodexCliToken(allocator)) |token| {
+        token.deinit(allocator);
+        return true;
+    }
+
+    return false;
+}
+
+pub fn loadStoredOpenAiCodexCredential(allocator: std.mem.Allocator) ?auth.OAuthToken {
+    return auth.loadCredential(allocator, OPENAI_CODEX_CREDENTIAL_KEY) catch null;
 }
 
 pub fn resolveCodexCommand(allocator: std.mem.Allocator) ?[]u8 {
@@ -186,51 +201,20 @@ fn containsString(haystack: []const []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn hasNullclawOpenAiCodexTokens(allocator: std.mem.Allocator) bool {
-    const path = resolveHomeRelativePath(allocator, ".nullclaw", "auth.json") catch return false;
+pub fn loadCodexCliToken(allocator: std.mem.Allocator) ?auth.OAuthToken {
+    const path = resolveCodexStatePath(allocator, "auth.json") catch return null;
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
+    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
     defer file.close();
 
-    const bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch return false;
+    const bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch return null;
     defer allocator.free(bytes);
 
-    return parseNullclawOpenAiCodexCredentialFromBytes(allocator, bytes);
+    return parseCodexCliTokenFromBytes(allocator, bytes);
 }
 
-fn parseNullclawOpenAiCodexCredentialFromBytes(allocator: std.mem.Allocator, bytes: []const u8) bool {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
-    defer parsed.deinit();
-
-    const root_obj = switch (parsed.value) {
-        .object => |obj| obj,
-        else => return false,
-    };
-
-    const provider_val = root_obj.get("openai-codex") orelse return false;
-    const provider_obj = switch (provider_val) {
-        .object => |obj| obj,
-        else => return false,
-    };
-
-    return hasTokenField(provider_obj, "access_token") or hasTokenField(provider_obj, "refresh_token");
-}
-
-fn hasCodexCliTokens(allocator: std.mem.Allocator) bool {
-    const path = resolveCodexStatePath(allocator, "auth.json") catch return false;
-    defer allocator.free(path);
-
-    const file = std.fs.openFileAbsolute(path, .{}) catch return false;
-    defer file.close();
-
-    const bytes = file.readToEndAlloc(allocator, 1024 * 1024) catch return false;
-    defer allocator.free(bytes);
-
-    return parseCodexCliAuthFromBytes(allocator, bytes);
-}
-
-fn parseCodexCliAuthFromBytes(allocator: std.mem.Allocator, bytes: []const u8) bool {
+fn parseCodexCliTokenFromBytes(allocator: std.mem.Allocator, bytes: []const u8) ?auth.OAuthToken {
     const parsed = std.json.parseFromSlice(struct {
         tokens: ?struct {
             access_token: ?[]const u8 = null,
@@ -239,24 +223,40 @@ fn parseCodexCliAuthFromBytes(allocator: std.mem.Allocator, bytes: []const u8) b
     }, allocator, bytes, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
-    }) catch return false;
+    }) catch return null;
     defer parsed.deinit();
 
-    const tokens = parsed.value.tokens orelse return false;
-    if (tokens.access_token) |access_token| {
-        if (access_token.len > 0) return true;
-    }
-    if (tokens.refresh_token) |refresh_token| {
-        if (refresh_token.len > 0) return true;
-    }
-    return false;
-}
+    const tokens = parsed.value.tokens orelse return null;
+    const access_token_str = tokens.access_token orelse return null;
+    if (access_token_str.len == 0) return null;
 
-fn hasTokenField(obj: std.json.ObjectMap, key: []const u8) bool {
-    const value = obj.get(key) orelse return false;
-    return switch (value) {
-        .string => |s| s.len > 0,
-        else => false,
+    const access_token = allocator.dupe(u8, access_token_str) catch return null;
+    errdefer allocator.free(access_token);
+
+    const refresh_token: ?[]const u8 = if (tokens.refresh_token) |rt|
+        if (rt.len > 0) allocator.dupe(u8, rt) catch null else null
+    else
+        null;
+    errdefer if (refresh_token) |rt| allocator.free(rt);
+
+    const expires_at = decodeJwtExp(allocator, access_token);
+    if (expires_at != 0 and std.time.timestamp() + 300 >= expires_at and refresh_token == null) {
+        allocator.free(access_token);
+        if (refresh_token) |rt| allocator.free(rt);
+        return null;
+    }
+
+    const token_type = allocator.dupe(u8, "Bearer") catch {
+        allocator.free(access_token);
+        if (refresh_token) |rt| allocator.free(rt);
+        return null;
+    };
+
+    return .{
+        .access_token = access_token,
+        .refresh_token = refresh_token,
+        .expires_at = expires_at,
+        .token_type = token_type,
     };
 }
 
@@ -268,6 +268,37 @@ fn resolveHomeRelativePath(allocator: std.mem.Allocator, dir_name: []const u8, f
     const home = try platform.getHomeDir(allocator);
     defer allocator.free(home);
     return std.fs.path.join(allocator, &.{ home, dir_name, filename });
+}
+
+fn decodeJwtExp(allocator: std.mem.Allocator, token: []const u8) i64 {
+    const first_dot = std.mem.indexOfScalar(u8, token, '.') orelse return 0;
+    const rest = token[first_dot + 1 ..];
+    const second_dot = std.mem.indexOfScalar(u8, rest, '.') orelse return 0;
+    const payload_b64 = rest[0..second_dot];
+    if (payload_b64.len == 0) return 0;
+
+    const Decoder = std.base64.url_safe_no_pad.Decoder;
+    const decoded_len = Decoder.calcSizeForSlice(payload_b64) catch return 0;
+    const decoded = allocator.alloc(u8, decoded_len) catch return 0;
+    defer allocator.free(decoded);
+    Decoder.decode(decoded, payload_b64) catch return 0;
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, decoded, .{}) catch return 0;
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return 0,
+    };
+
+    if (obj.get("exp")) |exp_val| {
+        switch (exp_val) {
+            .integer => |i| return i,
+            .float => |f| return @intFromFloat(f),
+            else => {},
+        }
+    }
+    return 0;
 }
 
 fn resolveFromPath(allocator: std.mem.Allocator, binary_name: []const u8) ?[]u8 {
@@ -335,24 +366,32 @@ test "parseCodexModelsFromBytes parses visible model slugs" {
     try std.testing.expectEqualStrings("gpt-5.2-codex", models[1]);
 }
 
-test "parseCodexCliAuthFromBytes accepts access token" {
-    try std.testing.expect(parseCodexCliAuthFromBytes(std.testing.allocator,
+test "parseCodexCliTokenFromBytes accepts access token" {
+    const token = parseCodexCliTokenFromBytes(std.testing.allocator,
         \\{
         \\  "tokens": {
         \\    "access_token": "abc",
         \\    "refresh_token": ""
         \\  }
         \\}
-    ));
+    ) orelse return error.TestUnexpectedResult;
+    defer token.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("abc", token.access_token);
+    try std.testing.expect(token.refresh_token == null);
 }
 
-test "parseNullclawOpenAiCodexCredentialFromBytes accepts refresh token" {
-    try std.testing.expect(parseNullclawOpenAiCodexCredentialFromBytes(std.testing.allocator,
+test "parseCodexCliTokenFromBytes keeps expired token when refresh token exists" {
+    const token = parseCodexCliTokenFromBytes(std.testing.allocator,
         \\{
-        \\  "openai-codex": {
-        \\    "access_token": "",
+        \\  "tokens": {
+        \\    "access_token": "x.eyJleHAiOjF9.y",
         \\    "refresh_token": "refresh"
         \\  }
         \\}
-    ));
+    ) orelse return error.TestUnexpectedResult;
+    defer token.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("x.eyJleHAiOjF9.y", token.access_token);
+    try std.testing.expectEqualStrings("refresh", token.refresh_token.?);
 }
