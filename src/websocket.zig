@@ -1,6 +1,6 @@
-//! Generic RFC 6455 WebSocket client over TLS.
-//! Used by Discord, Lark, DingTalk, QQ gateway channels.
-//! All connections are TLS-only (wss://).
+//! Generic RFC 6455 WebSocket client.
+//! Used by Discord, Lark, DingTalk, QQ gateway channels and OneBot.
+//! Supports both `wss://` and `ws://` transports.
 
 const std = @import("std");
 
@@ -39,7 +39,6 @@ pub const TlsState = struct {
     write_buf: []u8,
     tls_read_buf: []u8,
     tls_write_buf: []u8,
-    scratch: [4096]u8 = undefined,
 
     pub fn deinit(self: *TlsState, allocator: std.mem.Allocator) void {
         allocator.free(self.read_buf);
@@ -195,7 +194,12 @@ pub const WsClient = struct {
         var resp_len: usize = 0;
         var headers_complete = false;
         while (resp_len < resp_buf.len) {
-            try self.readExact(resp_buf[resp_len .. resp_len + 1]);
+            if (self.tls) |tls| {
+                const byte_ptr = tls.tls_client.reader.take(1) catch return error.WsHandshakeFailed;
+                resp_buf[resp_len] = byte_ptr[0];
+            } else {
+                self.readExact(resp_buf[resp_len .. resp_len + 1]) catch return error.WsHandshakeFailed;
+            }
             resp_len += 1;
             if (resp_len >= 4 and
                 resp_buf[resp_len - 4] == '\r' and
