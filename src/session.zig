@@ -11,6 +11,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
+const fs_compat = @import("fs_compat.zig");
 const agent_routing = @import("agent_routing.zig");
 const agent_mod = @import("agent/root.zig");
 const Agent = agent_mod.Agent;
@@ -398,7 +399,7 @@ pub const SessionManager = struct {
         defer if (file_needs_close) file.close();
 
         const now_ts = std.time.timestamp();
-        const stat = file.stat() catch return;
+        const stat = fs_compat.stat(file) catch return;
         self.initializeUsageLedgerState(&file, stat, now_ts);
 
         const record_line = std.fmt.allocPrint(
@@ -485,7 +486,7 @@ pub const SessionManager = struct {
             session.agent.clearInterruptRequest();
         }
 
-        // Set conversation context for this turn (Signal-specific for now)
+        // Set conversation context for this turn.
         session.agent.conversation_context = conversation_context;
         defer session.agent.conversation_context = null;
 

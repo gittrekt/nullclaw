@@ -25,6 +25,7 @@ const memory_mod = @import("memory/root.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
 const streaming = @import("streaming.zig");
+const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const thread_stacks = @import("thread_stacks.zig");
 
 const log = std.log.scoped(.daemon);
@@ -514,6 +515,12 @@ fn parseInboundMetadata(allocator: std.mem.Allocator, metadata_json: ?[]const u8
         if (pm.value.object.get("is_group")) |v| {
             if (v == .bool) parsed.fields.is_group = v.bool;
         }
+        if (pm.value.object.get("sender_username")) |v| {
+            if (v == .string) parsed.fields.sender_username = v.string;
+        }
+        if (pm.value.object.get("sender_display_name")) |v| {
+            if (v == .string) parsed.fields.sender_display_name = v.string;
+        }
     }
     return parsed;
 }
@@ -696,7 +703,9 @@ fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
 }
 
 fn supportsStreamingOutbound(channel: []const u8) bool {
-    return std.mem.eql(u8, channel, "web") or std.mem.eql(u8, channel, "telegram");
+    return std.mem.eql(u8, channel, "web") or
+        std.mem.eql(u8, channel, "telegram") or
+        std.mem.eql(u8, channel, "dingtalk");
 }
 
 fn makeAssistantReplyOutbound(
@@ -803,10 +812,24 @@ fn inboundDispatcherThread(
             defer channels_mod.max.setInteractiveOwnerContext(null);
         }
 
+        // Build conversation context for channels that provide sender metadata.
+        // Discord passes sender info via metadata JSON; Signal/Telegram do it in channel_loop.
+        const conversation_context: ?ConversationContext = if (std.mem.eql(u8, msg.channel, "discord"))
+            .{
+                .channel = "discord",
+                .sender_id = msg.sender_id,
+                .sender_username = parsed_meta.fields.sender_username,
+                .sender_display_name = parsed_meta.fields.sender_display_name,
+                .group_id = parsed_meta.fields.guild_id,
+                .is_group = if (parsed_meta.fields.is_dm) |dm| !dm else null,
+            }
+        else
+            null;
+
         const reply = runtime.session_mgr.processMessageStreaming(
             session_key,
             msg.content,
-            null,
+            conversation_context,
             stream_sink,
         ) catch |err| {
             log.warn("inbound dispatch process failed: {}", .{err});
@@ -1102,6 +1125,19 @@ test "makeStreamingSinkForChannel filters web chunks" {
 
     try std.testing.expectEqualStrings("AB", collector.text());
     try std.testing.expect(collector.got_final);
+}
+
+test "makeStreamingSinkForChannel supports dingtalk" {
+    const Noop = struct {
+        fn callback(_: *anyopaque, _: streaming.Event) void {}
+    };
+
+    var filter: streaming.TagFilter = undefined;
+    const sink = makeStreamingSinkForChannel("dingtalk", .{
+        .callback = Noop.callback,
+        .ctx = undefined,
+    }, &filter);
+    try std.testing.expect(sink != null);
 }
 
 test "makeStreamingSinkForChannel returns null for unsupported channel" {
@@ -1874,6 +1910,17 @@ test "parseInboundMetadata extracts message_id and thread_id" {
     try std.testing.expectEqualStrings("C1", parsed.fields.channel_id.?);
     try std.testing.expectEqualStrings("1700.1", parsed.fields.message_id.?);
     try std.testing.expectEqualStrings("1700.0", parsed.fields.thread_id.?);
+}
+
+test "parseInboundMetadata extracts discord sender identity fields" {
+    var parsed = parseInboundMetadata(
+        std.testing.allocator,
+        "{\"sender_username\":\"discord-user\",\"sender_display_name\":\"Discord User\"}",
+    );
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("discord-user", parsed.fields.sender_username.?);
+    try std.testing.expectEqualStrings("Discord User", parsed.fields.sender_display_name.?);
 }
 
 test "makeAssistantReplyOutbound preserves plain replies without choices" {

@@ -6,12 +6,13 @@
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark, /qq, /max, /slack/events
+//!   - Endpoints: /health, /ready, /pair, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /qq, /max, /slack/events
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
 const std = @import("std");
 const build_options = @import("build_options");
+const daemon = @import("daemon.zig");
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
@@ -29,6 +30,8 @@ const security = @import("security/policy.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
+const a2a = @import("a2a.zig");
+const thread_stacks = @import("thread_stacks.zig");
 
 /// Maximum request body size (64KB) — prevents memory exhaustion.
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -37,6 +40,7 @@ const MAX_HTTP_REQUEST_SIZE: usize = MAX_HEADER_SIZE + MAX_BODY_SIZE;
 
 /// Request timeout (30s) — prevents slow-loris attacks.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+const ACCEPT_POLL_INTERVAL_MS: u64 = 100;
 
 /// Sliding window for rate limiting (60s).
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
@@ -2842,6 +2846,50 @@ fn applyRuntimeProviderOverrides(config: *const Config) !void {
     try providers.setApiErrorLimitOverride(config.diagnostics.api_error_max_chars);
 }
 
+const A2aStreamingWorker = struct {
+    allocator: std.mem.Allocator,
+    body: []u8,
+    stream: std.net.Stream,
+    registry: *a2a.TaskRegistry,
+    session_mgr: *session_mod.SessionManager,
+
+    fn run(self: *@This()) void {
+        defer self.stream.close();
+        defer self.allocator.free(self.body);
+        defer self.allocator.destroy(self);
+        a2a.handleStreamingRpc(self.allocator, self.body, &self.stream, self.registry, self.session_mgr);
+    }
+};
+
+fn spawnA2aStreamingWorker(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    stream: std.net.Stream,
+    registry: *a2a.TaskRegistry,
+    session_mgr: *session_mod.SessionManager,
+) !void {
+    const worker = try allocator.create(A2aStreamingWorker);
+    errdefer allocator.destroy(worker);
+
+    const owned_body = try allocator.dupe(u8, body);
+    errdefer allocator.free(owned_body);
+
+    worker.* = .{
+        .allocator = allocator,
+        .body = owned_body,
+        .stream = stream,
+        .registry = registry,
+        .session_mgr = session_mgr,
+    };
+
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
+        A2aStreamingWorker.run,
+        .{worker},
+    );
+    thread.detach();
+}
+
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
 /// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, POST /qq, POST /max
 /// If config_ptr is null, loads config internally (for backward compatibility).
@@ -2875,6 +2923,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var sec_policy_opt: ?security.SecurityPolicy = null;
     var gateway_thread_observer = GatewayThreadObserver.init(allocator);
     defer gateway_thread_observer.deinit();
+    var a2a_registry = a2a.TaskRegistry.init(allocator);
+    defer a2a_registry.deinit();
     const needs_local_agent = event_bus == null;
 
     if (config_opt) |cfg_ptr| {
@@ -2925,8 +2975,9 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         }
 
         // In daemon mode (`event_bus` is present), inbound processing is delegated to
-        // the bus + channel runtime. Avoid creating a second local agent runtime here.
-        if (needs_local_agent) {
+        // the bus + channel runtime. However, A2A requires a synchronous session manager
+        // for request-response JSON-RPC, so also init when A2A is enabled.
+        if (needs_local_agent or cfg.a2a.enabled) {
             sec_tracker_opt = security.RateTracker.init(allocator, cfg.autonomy.max_actions_per_hour);
             sec_policy_opt = .{
                 .autonomy = cfg.autonomy.level,
@@ -3017,8 +3068,12 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
     // Resolve the listen address
     const addr = try std.net.Address.resolveIp(host, port);
+    const daemon_mode = event_bus != null;
     var server = try addr.listen(.{
         .reuse_address = true,
+        // Daemon/service shutdown needs the accept loop to observe the shared
+        // shutdown flag instead of blocking forever in accept().
+        .force_nonblocking = daemon_mode,
     });
     defer server.deinit();
 
@@ -3044,8 +3099,17 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
     // Accept loop — read raw HTTP from TCP connections
     while (true) {
-        var conn = server.accept() catch continue;
-        defer conn.stream.close();
+        if (daemon_mode and daemon.isShutdownRequested()) break;
+
+        var conn = server.accept() catch |err| switch (err) {
+            error.WouldBlock => {
+                std.Thread.sleep(ACCEPT_POLL_INTERVAL_MS * std.time.ns_per_ms);
+                continue;
+            },
+            else => continue,
+        };
+        var close_conn = true;
+        defer if (close_conn) conn.stream.close();
         configureRequestReadTimeout(&conn.stream);
 
         // Per-request arena — all request-scoped allocations freed in one shot
@@ -3113,6 +3177,71 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             handleSlackWebhookRoute(&webhook_ctx);
             response_status = webhook_ctx.response_status;
             response_body = webhook_ctx.response_body;
+        } else if (std.mem.eql(u8, base_path, "/.well-known/agent.json") or
+            std.mem.eql(u8, base_path, "/.well-known/agent-card.json"))
+        {
+            // A2A Agent Card discovery (public, no auth).
+            if (config_opt) |cfg| {
+                if (cfg.a2a.enabled) {
+                    const card = a2a.handleAgentCard(req_allocator, cfg);
+                    response_status = card.status;
+                    response_body = card.body;
+                } else {
+                    response_status = "404 Not Found";
+                    response_body = "{\"error\":\"a2a not enabled\"}";
+                }
+            } else {
+                response_status = "404 Not Found";
+                response_body = "{\"error\":\"not configured\"}";
+            }
+        } else if (std.mem.eql(u8, base_path, "/a2a")) {
+            // A2A JSON-RPC endpoint (auth required).
+            if (!is_post) {
+                response_status = "405 Method Not Allowed";
+                response_body = "{\"error\":\"method not allowed\"}";
+            } else if (config_opt == null or !config_opt.?.a2a.enabled) {
+                response_status = "404 Not Found";
+                response_body = "{\"error\":\"a2a not enabled\"}";
+            } else {
+                const auth_header = extractHeader(raw, "Authorization");
+                const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
+                const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
+                if (!isWebhookAuthorized(pairing_guard, bearer)) {
+                    response_status = "401 Unauthorized";
+                    response_body = "{\"error\":\"unauthorized\"}";
+                } else if (!state.rate_limiter.allowWebhook(state.allocator, "a2a")) {
+                    response_status = "429 Too Many Requests";
+                    response_body = "{\"error\":\"rate limited\"}";
+                } else {
+                    const body = extractBody(raw);
+                    if (body) |b| {
+                        if (session_mgr_opt) |*sm| {
+                            if (a2a.isStreamingMethod(b)) {
+                                // SSE streaming runs in its own worker so the main accept
+                                // loop can continue serving tasks/cancel and new requests.
+                                if (spawnA2aStreamingWorker(allocator, b, conn.stream, &a2a_registry, sm)) {
+                                    close_conn = false;
+                                    response_status = "";
+                                    response_body = "";
+                                } else |_| {
+                                    response_status = "503 Service Unavailable";
+                                    response_body = "{\"error\":\"stream setup failed\"}";
+                                }
+                            } else {
+                                const resp = a2a.handleJsonRpc(req_allocator, b, &a2a_registry, sm);
+                                response_status = resp.status;
+                                response_body = resp.body;
+                            }
+                        } else {
+                            response_status = "503 Service Unavailable";
+                            response_body = "{\"error\":\"agent not available\"}";
+                        }
+                    } else {
+                        response_status = "400 Bad Request";
+                        response_body = "{\"error\":\"empty body\"}";
+                    }
+                }
+            }
         } else if (control_route_map.get(base_path)) |route| switch (route) {
             .health => {
                 response_body = if (isHealthOk()) "{\"status\":\"ok\"}" else "{\"status\":\"degraded\"}";
@@ -3237,8 +3366,10 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             response_body = "{\"error\":\"not found\"}";
         }
 
-        // Send HTTP response
-        writeJsonResponse(&conn.stream, response_status, response_body);
+        // Send HTTP response (skip if SSE streaming already wrote directly).
+        if (response_status.len > 0) {
+            writeJsonResponse(&conn.stream, response_status, response_body);
+        }
     }
 }
 

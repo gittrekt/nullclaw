@@ -452,6 +452,8 @@ pub const DingTalkConfig = struct {
     client_id: []const u8,
     client_secret: []const u8,
     allow_from: []const []const u8 = &.{},
+    ai_card_template_id: ?[]const u8 = null,
+    ai_card_streaming_key: ?[]const u8 = null,
 };
 
 pub const SignalConfig = struct {
@@ -1134,6 +1136,16 @@ pub const GatewayConfig = struct {
     webhook_rate_limit_per_minute: u32 = 60,
     idempotency_ttl_secs: u64 = 300,
     paired_tokens: []const []const u8 = &.{},
+};
+
+// ── A2A (Agent-to-Agent) protocol config ────────────────────────
+
+pub const A2aConfig = struct {
+    enabled: bool = false,
+    name: []const u8 = "NullClaw",
+    description: []const u8 = "AI assistant",
+    url: []const u8 = "",
+    version: []const u8 = "1.0.0",
 };
 
 // ── Composio config ─────────────────────────────────────────────
